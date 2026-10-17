@@ -57,6 +57,7 @@ func main() {
 	root.AddCommand(newExportCommand())
 	root.AddCommand(newHubCommand())
 	root.AddCommand(newHubViewCommand())
+	root.AddCommand(newWebCommand())
 	root.AddCommand(newAntigravityCommand())
 	root.AddCommand(newStatuslineCommand())
 	root.AddCommand(newTmuxCommand())
