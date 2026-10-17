@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/janekbaraniewski/openusage/internal/core"
@@ -117,6 +118,8 @@ func cardsFrom(snaps []core.UsageSnapshot) []Card {
 // Server serves the usage web UI and JSON API.
 type Server struct {
 	addr string
+	mu   sync.RWMutex
+	last Payload
 }
 
 func NewServer(addr string) *Server {
@@ -124,7 +127,18 @@ func NewServer(addr string) *Server {
 	if addr == "" {
 		addr = "127.0.0.1:8060"
 	}
-	return &Server{addr: addr}
+	return &Server{
+		addr: addr,
+		last: Payload{
+			FetchedAt: time.Time{},
+			Cards: []Card{{
+				ID:      "loading",
+				Name:    "Loading",
+				Status:  "UNKNOWN",
+				Message: "Collecting snapshots…",
+			}},
+		},
+	}
 }
 
 func (s *Server) handler() http.Handler {
@@ -153,8 +167,14 @@ func (s *Server) handlePage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-	defer cancel()
+	s.mu.RLock()
+	payload := s.last
+	s.mu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func (s *Server) refresh(ctx context.Context) {
 	snaps, _, err := export.Collect(ctx, export.SourceDirect)
 	payload := Payload{FetchedAt: time.Now().UTC()}
 	if err != nil {
@@ -167,12 +187,26 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	} else {
 		payload.Cards = cardsFrom(snaps)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(payload)
+	s.mu.Lock()
+	s.last = payload
+	s.mu.Unlock()
 }
 
 // ListenAndServe serves until ctx is done.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	go func() {
+		s.refresh(ctx)
+		t := time.NewTicker(45 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.refresh(ctx)
+			}
+		}
+	}()
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("web: listen %s: %w", s.addr, err)
