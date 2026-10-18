@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/janekbaraniewski/openusage/internal/core"
@@ -161,6 +162,7 @@ func fetchCodexRateLimitsRPCProcess(ctx context.Context, acct core.AccountConfig
 	rpcCtx, cancel := context.WithTimeout(ctx, codexRPCTimeout(ctx, time.Now()))
 	defer cancel()
 	cmd := exec.CommandContext(rpcCtx, binary, "app-server", "--stdio")
+	isolateProcessGroup(cmd)
 	cmd.Stderr = io.Discard
 	cmd.Env = codexAppServerEnv(os.Environ(), binary, configDir)
 
@@ -172,24 +174,36 @@ func fetchCodexRateLimitsRPCProcess(ctx context.Context, acct core.AccountConfig
 	if err != nil {
 		return codexCLIRateLimitsResult{}, fmt.Errorf("codex: creating app-server stdout: %w", err)
 	}
+
+	// waited is read by killProcess from the os/exec watchdog goroutine and
+	// written here, so it is atomic.
+	var waited atomic.Bool
+	var waitErr error
+	// killProcess stops the whole tree at most once. It runs when rpcCtx ends
+	// and again after a normal round trip, so the child never outlives the
+	// request.
+	killProcess := func() error {
+		if waited.Load() {
+			return nil
+		}
+		return killProcessTree(cmd)
+	}
+	cmd.Cancel = killProcess
+	cmd.WaitDelay = codexRPCWaitDelay
+
 	if err := cmd.Start(); err != nil {
 		return codexCLIRateLimitsResult{}, fmt.Errorf("codex: starting app-server: %w", err)
 	}
 	// waitProcess reaps the child at most once; rpcCtx bounds it because
 	// exec.CommandContext kills the process when the context is done.
-	waited := false
-	var waitErr error
 	waitProcess := func() error {
-		if !waited {
-			waited = true
+		if waited.CompareAndSwap(false, true) {
 			waitErr = cmd.Wait()
 		}
 		return waitErr
 	}
 	defer func() {
-		if !waited && cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
+		_ = killProcess()
 		_ = waitProcess()
 	}()
 
@@ -250,6 +264,10 @@ func fetchCodexRateLimitsRPCProcess(ctx context.Context, acct core.AccountConfig
 // codexRPCMaxTimeout bounds the app-server round trip when the caller has no
 // tighter deadline.
 const codexRPCMaxTimeout = 8 * time.Second
+
+// codexRPCWaitDelay bounds how long cmd.Wait waits for the app-server pipes to
+// close after the kill, so a surviving child cannot block the collector.
+const codexRPCWaitDelay = 2 * time.Second
 
 // codexRPCTimeout returns how long the app-server RPC may run. The daemon
 // polls each provider with an 8s deadline; letting the RPC use all of it

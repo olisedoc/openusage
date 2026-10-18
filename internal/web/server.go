@@ -21,11 +21,11 @@ var pageFS embed.FS
 
 // Card is one provider tile for the web dashboard.
 type Card struct {
-	ID       string      `json:"id"`
-	Name     string      `json:"name"`
-	Status   string      `json:"status"`
-	Message  string      `json:"message,omitempty"`
-	Metrics  []MetricBar `json:"metrics"`
+	ID      string      `json:"id"`
+	Name    string      `json:"name"`
+	Status  string      `json:"status"`
+	Message string      `json:"message,omitempty"`
+	Metrics []MetricBar `json:"metrics"`
 }
 
 // MetricBar is a remaining-quota bar.
@@ -55,9 +55,18 @@ func displayName(providerID string) string {
 	}
 }
 
+// barsFrom returns the quota bars of a snapshot: metrics with a limit and a
+// reset time. Counters, costs and estimates are not quota, so they are left to
+// the provider message instead of being drawn as an empty bar.
 func barsFrom(snap core.UsageSnapshot) []MetricBar {
 	keys := make([]string, 0, len(snap.Metrics))
-	for k := range snap.Metrics {
+	for k, m := range snap.Metrics {
+		if m.Limit == nil {
+			continue
+		}
+		if _, ok := snap.Resets[k]; !ok {
+			continue
+		}
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
@@ -117,9 +126,24 @@ func cardsFrom(snaps []core.UsageSnapshot) []Card {
 
 // Server serves the usage web UI and JSON API.
 type Server struct {
-	addr string
-	mu   sync.RWMutex
-	last Payload
+	addr    string
+	mu      sync.RWMutex
+	last    Payload
+	budget  time.Duration
+	collect func(context.Context) ([]core.UsageSnapshot, error)
+}
+
+// refreshBudget bounds one collection so a wedged provider cannot leave the
+// dashboard on the loading card forever.
+const refreshBudget = 45 * time.Second
+
+// refreshGrace lets a collection that honours its own deadline publish before
+// the watchdog steps in.
+const refreshGrace = 2 * time.Second
+
+func collectDirect(ctx context.Context) ([]core.UsageSnapshot, error) {
+	snaps, _, err := export.Collect(ctx, export.SourceDirect)
+	return snaps, err
 }
 
 func NewServer(addr string) *Server {
@@ -128,7 +152,9 @@ func NewServer(addr string) *Server {
 		addr = "127.0.0.1:8060"
 	}
 	return &Server{
-		addr: addr,
+		addr:    addr,
+		budget:  refreshBudget,
+		collect: collectDirect,
 		last: Payload{
 			FetchedAt: time.Time{},
 			Cards: []Card{{
@@ -175,7 +201,36 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) refresh(ctx context.Context) {
-	snaps, _, err := export.Collect(ctx, export.SourceDirect)
+	if ctx.Err() != nil {
+		return
+	}
+	done := make(chan Payload, 1)
+	go func() {
+		collectCtx, cancel := context.WithTimeout(ctx, s.budget)
+		defer cancel()
+		done <- s.collectPayload(collectCtx)
+	}()
+	timer := time.NewTimer(s.budget + refreshGrace)
+	defer timer.Stop()
+	select {
+	case payload := <-done:
+		s.setPayload(payload)
+	case <-timer.C:
+		s.setPayload(Payload{
+			FetchedAt: time.Now().UTC(),
+			Cards: []Card{{
+				ID:      "timeout",
+				Name:    "Collect timed out",
+				Status:  "ERROR",
+				Message: "no snapshot within " + s.budget.String(),
+			}},
+		})
+	case <-ctx.Done():
+	}
+}
+
+func (s *Server) collectPayload(ctx context.Context) Payload {
+	snaps, err := s.collect(ctx)
 	payload := Payload{FetchedAt: time.Now().UTC()}
 	if err != nil {
 		payload.Cards = []Card{{
@@ -184,9 +239,13 @@ func (s *Server) refresh(ctx context.Context) {
 			Status:  "ERROR",
 			Message: err.Error(),
 		}}
-	} else {
-		payload.Cards = cardsFrom(snaps)
+		return payload
 	}
+	payload.Cards = cardsFrom(snaps)
+	return payload
+}
+
+func (s *Server) setPayload(payload Payload) {
 	s.mu.Lock()
 	s.last = payload
 	s.mu.Unlock()

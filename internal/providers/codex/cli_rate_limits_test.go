@@ -138,6 +138,40 @@ printf '%s\n' '{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":0,"windo
 	}
 }
 
+// TestRPCProcessKillsChildHoldingStdout covers the Node shim: codex spawns the
+// real binary as a child, so killing only the shim left the child holding the
+// stdout pipe and the call blocked until that child exited.
+func TestRPCProcessKillsChildHoldingStdout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX shell script as the fake codex binary")
+	}
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\nread first\nsleep 30 &\nexec sleep 30\n"
+	if err := os.WriteFile(binary, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, err := fetchCodexRateLimitsRPCProcess(ctx, core.AccountConfig{Binary: binary}, dir)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("got %v, want a timeout", err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("returned after %s", elapsed)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("fetchCodexRateLimitsRPCProcess did not return")
+	}
+}
+
 func TestFetchRPCWithoutLocalHistory(t *testing.T) {
 	dir := t.TempDir()
 	stubCodexRPC(t, dir, `{"rateLimits":{"limitId":"codex","primary":{"usedPercent":34,"windowDurationMins":10080}}}`, nil)
